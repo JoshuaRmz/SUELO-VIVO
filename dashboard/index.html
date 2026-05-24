@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Suelo Vivo — Monitor de Suelo Agrícola</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
+  import { getDatabase, ref, onValue, query, limitToLast, orderByKey }
+    from "https://www.gstatic.com/firebasejs/10.8.0/firebase-database.js";
+
+  // ─── CONFIGURACIÓN FIREBASE ───────────────────────────────────
+  const firebaseConfig = {
+  apiKey: "AIzaSyAQWfoyt1xUJ5B600cVSUuGeBcapTAGrLw",
+  authDomain: "suelo-vivo.firebaseapp.com",
+  databaseURL: "https://suelo-vivo-default-rtdb.firebaseio.com",
+  projectId: "suelo-vivo",
+  };
+  // ─────────────────────────────────────────────────────────────
+
+  const app = initializeApp(firebaseConfig);
+  const db  = getDatabase(app);
+
+  const NODO_IDS = [1, 2, 3];
+
+  // Umbrales por cultivo (deben coincidir con el firmware)
+  const CULTIVOS = {
+    0: { nombre: "Caña de azúcar", humMin: 50, humOpt: 65, humMax: 80, icon: "🌿" },
+    1: { nombre: "Maíz / sorgo",   humMin: 45, humOpt: 60, humMax: 75, icon: "🌽" },
+    2: { nombre: "Hortalizas",     humMin: 55, humOpt: 70, humMax: 85, icon: "🍅" },
+    3: { nombre: "Cítricos",       humMin: 40, humOpt: 55, humMax: 70, icon: "🍊" },
+  };
+
+  function nivelHumedad(vwc, cultivo) {
+    const c = CULTIVOS[cultivo] || CULTIVOS[0];
+    if (vwc < c.humMin) return { estado: 'seco',    label: 'REGAR AHORA', color: '#e17055' };
+    if (vwc > c.humMax) return { estado: 'exceso',  label: 'EXCESO AGUA', color: '#0984e3' };
+    return                     { estado: 'optimo',  label: 'ÓPTIMO',      color: '#00b894' };
+  }
+
+  function recomendacion(datos) {
+    const cultivo = CULTIVOS[datos.cultivo] || CULTIVOS[0];
+    const hum = datos.humedad_vwc ?? 0;
+    const alertas = datos.alerta ?? 0;
+    const recs = [];
+
+    if (alertas & 0x01) recs.push(`💧 Regar hasta alcanzar ${cultivo.humOpt}% VWC`);
+    if (alertas & 0x02) recs.push(`🚫 Revisar drenaje — exceso de agua`);
+    if (alertas & 0x04) recs.push(`🌡 Temperatura de suelo fuera de rango óptimo`);
+    if (alertas & 0x08) recs.push(`🌱 Nitrógeno bajo — aplicar fertilizante N`);
+    if (alertas & 0x10) recs.push(`🌱 Fósforo bajo — aplicar fertilizante P`);
+    if (alertas & 0x20) recs.push(`🌱 Potasio bajo — aplicar fertilizante K`);
+    if (recs.length === 0) recs.push(`✅ Condiciones óptimas — no se requiere acción`);
+    return recs;
+  }
+
+  function actualizarNodo(id, datos) {
+    const card = document.getElementById(`nodo-${id}`);
+    if (!card) return;
+
+    const hum   = datos.humedad_vwc  ?? 0;
+    const temp  = (datos.temp_x10 ?? 0) / 10;
+    const n     = datos.n_mg ?? 0;
+    const p     = datos.p_mg ?? 0;
+    const k     = datos.k_mg ?? 0;
+    const cultivo = datos.cultivo ?? 0;
+    const cult  = CULTIVOS[cultivo] || CULTIVOS[0];
+    const nivel = nivelHumedad(hum, cultivo);
+    const ts    = datos.timestamp
+      ? new Date(datos.timestamp).toLocaleTimeString('es-MX', {hour:'2-digit', minute:'2-digit'})
+      : '--:--';
+
+    card.dataset.estado = nivel.estado;
+    card.querySelector('.cultivo-nombre').textContent = `${cult.nombre}`;
+    card.querySelector('.hum-val').textContent = hum;
+    card.querySelector('.hum-estado').textContent = nivel.label;
+    card.querySelector('.hum-estado').style.color = nivel.color;
+    card.querySelector('.hum-bar-fill').style.width = hum + '%';
+    card.querySelector('.hum-bar-fill').style.background = nivel.color;
+    card.querySelector('.hum-min').textContent = cult.humMin;
+    card.querySelector('.hum-opt').textContent = cult.humOpt;
+    card.querySelector('.hum-max').textContent = cult.humMax;
+    card.querySelector('.temp-val').textContent = temp.toFixed(1);
+    card.querySelector('.n-val').textContent = n;
+    card.querySelector('.p-val').textContent = p;
+    card.querySelector('.k-val').textContent = k;
+    card.querySelector('.ts-val').textContent = ts;
+
+    const recsList = card.querySelector('.recs-list');
+    recsList.innerHTML = recomendacion(datos)
+      .map(r => `<li>${r}</li>`).join('');
+
+    card.classList.add('updated');
+    setTimeout(() => card.classList.remove('updated'), 800);
+  }
+
+  function dibujarHistorial(canvasId, arr) {
+    const canvas = document.getElementById(canvasId);
+    if (!canvas || arr.length < 2) return;
+    const W = canvas.width = canvas.offsetWidth;
+    const H = canvas.height = 60;
+    const ctx = canvas.getContext('2d');
+    const n = arr.length;
+    const pad = { l:4, r:4, t:6, b:4 };
+    const gW = W - pad.l - pad.r, gH = H - pad.t - pad.b;
+    ctx.clearRect(0, 0, W, H);
+    // Banda óptima
+    ctx.fillStyle = 'rgba(0,184,148,0.08)';
+    ctx.fillRect(pad.l, pad.t + gH * 0.2, gW, gH * 0.5);
+    // Línea humedad
+    ctx.beginPath(); ctx.strokeStyle = '#00b894'; ctx.lineWidth = 1.5; ctx.lineJoin = 'round';
+    arr.forEach((v, i) => {
+      const x = pad.l + (i / (n-1)) * gW;
+      const y = pad.t + (1 - v/100) * gH;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  }
+
+  NODO_IDS.forEach(id => {
+    onValue(ref(db, `/suelo_nodos/${id}/ultima_lectura`), snap => {
+      if (snap.exists()) actualizarNodo(id, snap.val());
+    });
+    const histRef = query(ref(db, `/suelo_lecturas/${id}`), orderByKey(), limitToLast(24));
+    onValue(histRef, snap => {
+      if (!snap.exists()) return;
+      const vals = Object.values(snap.val()).map(e => e.humedad_vwc ?? 0);
+      dibujarHistorial(`chart-${id}`, vals);
+    });
+  });
+
+  setInterval(() => {
+    const el = document.getElementById('reloj');
+    if (el) el.textContent = new Date().toLocaleTimeString('es-MX');
+  }, 1000);
+</script>
+
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg:     #0d1a0f;
+  --bg2:    #132016;
+  --bg3:    #1a2e1d;
+  --border: rgba(255,255,255,0.07);
+  --text:   #c8ddc8;
+  --muted:  #5a7a5a;
+  --green:  #00b894;
+  --amber:  #e17055;
+  --blue:   #0984e3;
+  --mono:   'IBM Plex Mono', monospace;
+  --sans:   'DM Sans', sans-serif;
+}
+html, body { min-height: 100vh; background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 14px; }
+body::before {
+  content: ''; position: fixed; inset: 0;
+  background-image: radial-gradient(circle at 20% 80%, rgba(0,184,148,0.04) 0%, transparent 50%),
+                    radial-gradient(circle at 80% 20%, rgba(0,184,148,0.03) 0%, transparent 50%);
+  pointer-events: none; z-index: 0;
+}
+.wrap { position: relative; z-index: 1; max-width: 1100px; margin: 0 auto; padding: 20px 16px 48px; }
+header { display: flex; align-items: flex-end; justify-content: space-between; margin-bottom: 28px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+.logo-title { font-family: var(--mono); font-size: 20px; font-weight: 600; color: #fff; }
+.logo-title span { color: var(--green); }
+.logo-sub { font-size: 11px; color: var(--muted); letter-spacing: .07em; text-transform: uppercase; margin-top: 3px; }
+.header-meta { font-family: var(--mono); font-size: 10px; color: var(--muted); text-align: right; line-height: 1.8; }
+#reloj { font-size: 17px; color: var(--green); display: block; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+.nodo-card {
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 12px;
+  overflow: hidden; transition: border-color .3s;
+  animation: fadeUp .4s ease both;
+}
+.nodo-card:nth-child(2) { animation-delay: .07s; }
+.nodo-card:nth-child(3) { animation-delay: .14s; }
+.nodo-card::before { content: ''; display: block; height: 3px; background: var(--green); transition: background .3s; }
+.nodo-card[data-estado="seco"]::before   { background: var(--amber); }
+.nodo-card[data-estado="exceso"]::before { background: var(--blue); }
+.nodo-card.updated { border-color: rgba(0,184,148,.3); }
+.card-head { display: flex; justify-content: space-between; align-items: center; padding: 11px 14px 8px; }
+.nodo-id { font-family: var(--mono); font-size: 9px; color: var(--muted); letter-spacing: .09em; text-transform: uppercase; }
+.cultivo-nombre { font-size: 12px; font-weight: 500; color: var(--text); }
+/* Humedad principal */
+.hum-block { padding: 10px 14px 8px; background: var(--bg3); }
+.hum-top { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; }
+.hum-val { font-family: var(--mono); font-size: 36px; font-weight: 600; color: #fff; line-height: 1; }
+.hum-unit { font-size: 12px; color: var(--muted); }
+.hum-estado { font-family: var(--mono); font-size: 10px; font-weight: 600; letter-spacing: .08em; margin-left: auto; }
+.hum-bar { height: 6px; background: var(--border); border-radius: 3px; overflow: visible; position: relative; margin-bottom: 4px; }
+.hum-bar-fill { height: 100%; border-radius: 3px; transition: width .6s, background .3s; }
+.hum-markers { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 9px; color: var(--muted); }
+/* Sensores secundarios */
+.sensors-grid { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 1px; background: var(--border); }
+.sens { background: var(--bg2); padding: 8px 6px; text-align: center; }
+.sens-label { font-size: 9px; color: var(--muted); letter-spacing: .06em; text-transform: uppercase; margin-bottom: 3px; }
+.sens-val { font-family: var(--mono); font-size: 15px; font-weight: 600; color: #fff; line-height: 1; }
+.sens-unit { font-size: 9px; color: var(--muted); margin-top: 1px; }
+/* Historial */
+.chart-wrap { padding: 6px 10px 4px; background: var(--bg3); }
+.chart-label { font-size: 9px; color: var(--muted); margin-bottom: 3px; letter-spacing: .05em; text-transform: uppercase; }
+canvas { width: 100%; height: 60px; display: block; }
+/* Recomendaciones */
+.recs { padding: 10px 14px 12px; }
+.recs-title { font-size: 10px; color: var(--muted); letter-spacing: .07em; text-transform: uppercase; margin-bottom: 6px; }
+.recs-list { list-style: none; display: flex; flex-direction: column; gap: 4px; }
+.recs-list li { font-size: 12px; color: var(--text); line-height: 1.4; }
+.card-foot { display: flex; justify-content: space-between; padding: 6px 14px 10px; background: var(--bg3); }
+.ts-val { font-family: var(--mono); font-size: 10px; color: var(--muted); }
+@keyframes fadeUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+@media (max-width: 560px) { .grid { grid-template-columns: 1fr; } header { flex-direction: column; gap: 10px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <div class="logo-title">Suelo<span>Vivo</span>_</div>
+      <div class="logo-sub">Monitor agrícola de suelo · Ciudad Mante, Tamaulipas</div>
+    </div>
+    <div class="header-meta">
+      <span id="reloj">--:--:--</span>
+      Red LoRa 915 MHz · Firebase RTDB
+    </div>
+  </header>
+
+  <div class="grid">
+    <!-- Nodo 1 -->
+    <div class="nodo-card" id="nodo-1" data-estado="optimo">
+      <div class="card-head">
+        <span class="nodo-id">Nodo 01 — Parcela Norte</span>
+        <span class="cultivo-nombre">Cañal cargando...</span>
+      </div>
+      <div class="hum-block">
+        <div class="hum-top">
+          <span class="hum-val">—</span><span class="hum-unit">% VWC</span>
+          <span class="hum-estado">—</span>
+        </div>
+        <div class="hum-bar"><div class="hum-bar-fill" style="width:0%"></div></div>
+        <div class="hum-markers">
+          <span>Seco &lt;<span class="hum-min">—</span>%</span>
+          <span>Óptimo <span class="hum-opt">—</span>%</span>
+          <span>Exceso &gt;<span class="hum-max">—</span>%</span>
+        </div>
+      </div>
+      <div class="sensors-grid">
+        <div class="sens"><div class="sens-label">Temp suelo</div><div class="sens-val temp-val">—</div><div class="sens-unit">°C</div></div>
+        <div class="sens"><div class="sens-label">N</div><div class="sens-val n-val">—</div><div class="sens-unit">mg/kg</div></div>
+        <div class="sens"><div class="sens-label">P</div><div class="sens-val p-val">—</div><div class="sens-unit">mg/kg</div></div>
+        <div class="sens"><div class="sens-label">K</div><div class="sens-val k-val">—</div><div class="sens-unit">mg/kg</div></div>
+      </div>
+      <div class="chart-wrap">
+        <div class="chart-label">Humedad — últimas 24 lecturas</div>
+        <canvas id="chart-1"></canvas>
+      </div>
+      <div class="recs"><div class="recs-title">Recomendación</div><ul class="recs-list"><li>Cargando...</li></ul></div>
+      <div class="card-foot"><span class="ts-val ts-val">--:--</span></div>
+    </div>
+
+    <!-- Nodo 2 -->
+    <div class="nodo-card" id="nodo-2" data-estado="optimo">
+      <div class="card-head">
+        <span class="nodo-id">Nodo 02 — Parcela Sur</span>
+        <span class="cultivo-nombre">Cargando...</span>
+      </div>
+      <div class="hum-block">
+        <div class="hum-top">
+          <span class="hum-val">—</span><span class="hum-unit">% VWC</span>
+          <span class="hum-estado">—</span>
+        </div>
+        <div class="hum-bar"><div class="hum-bar-fill" style="width:0%"></div></div>
+        <div class="hum-markers">
+          <span>Seco &lt;<span class="hum-min">—</span>%</span>
+          <span>Óptimo <span class="hum-opt">—</span>%</span>
+          <span>Exceso &gt;<span class="hum-max">—</span>%</span>
+        </div>
+      </div>
+      <div class="sensors-grid">
+        <div class="sens"><div class="sens-label">Temp suelo</div><div class="sens-val temp-val">—</div><div class="sens-unit">°C</div></div>
+        <div class="sens"><div class="sens-label">N</div><div class="sens-val n-val">—</div><div class="sens-unit">mg/kg</div></div>
+        <div class="sens"><div class="sens-label">P</div><div class="sens-val p-val">—</div><div class="sens-unit">mg/kg</div></div>
+        <div class="sens"><div class="sens-label">K</div><div class="sens-val k-val">—</div><div class="sens-unit">mg/kg</div></div>
+      </div>
+      <div class="chart-wrap">
+        <div class="chart-label">Humedad — últimas 24 lecturas</div>
+        <canvas id="chart-2"></canvas>
+      </div>
+      <div class="recs"><div class="recs-title">Recomendación</div><ul class="recs-list"><li>Cargando...</li></ul></div>
+      <div class="card-foot"><span class="ts-val ts-val">--:--</span></div>
+    </div>
+
+    <!-- Nodo 3 -->
+    <div class="nodo-card" id="nodo-3" data-estado="optimo">
+      <div class="card-head">
+        <span class="nodo-id">Nodo 03 — Huerto</span>
+        <span class="cultivo-nombre">Cargando...</span>
+      </div>
+      <div class="hum-block">
+        <div class="hum-top">
+          <span class="hum-val">—</span><span class="hum-unit">% VWC</span>
+          <span class="hum-estado">—</span>
+        </div>
+        <div class="hum-bar"><div class="hum-bar-fill" style="width:0%"></div></div>
+        <div class="hum-markers">
+          <span>Seco &lt;<span class="hum-min">—</span>%</span>
+          <span>Óptimo <span class="hum-opt">—</span>%</span>
+          <span>Exceso &gt;<span class="hum-max">—</span>%</span>
+        </div>
+      </div>
+      <div class="sensors-grid">
+        <div class="sens"><div class="sens-label">Temp suelo</div><div class="sens-val temp-val">—</div><div class="sens-unit">°C</div></div>
+        <div class="sens"><div class="sens-label">N</div><div class="sens-val n-val">—</div><div class="sens-unit">mg/kg</div></div>
+        <div class="sens"><div class="sens-label">P</div><div class="sens-val p-val">—</div><div class="sens-unit">mg/kg</div></div>
+        <div class="sens"><div class="sens-label">K</div><div class="sens-val k-val">—</div><div class="sens-unit">mg/kg</div></div>
+      </div>
+      <div class="chart-wrap">
+        <div class="chart-label">Humedad — últimas 24 lecturas</div>
+        <canvas id="chart-3"></canvas>
+      </div>
+      <div class="recs"><div class="recs-title">Recomendación</div><ul class="recs-list"><li>Cargando...</li></ul></div>
+      <div class="card-foot"><span class="ts-val ts-val">--:--</span></div>
+    </div>
+  </div>
+</div>
+</body>
+</html>
